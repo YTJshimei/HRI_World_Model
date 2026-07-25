@@ -1,0 +1,33 @@
+﻿# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+
+# IDE
+.vscode/
+.idea/
+
+# Models and datasets
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+models/
+data/
+datasets/
+checkpoints/
+results/
+
+# ROS data
+*.bag
+*.bag.active
+*.db3
+
+# Environment
+.env
+
+# Logs
+*.log
+logs/

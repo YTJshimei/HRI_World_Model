@@ -1,4 +1,4 @@
-﻿# Python
+# Python
 __pycache__/
 *.py[cod]
 .venv/
@@ -14,11 +14,11 @@ venv/
 *.ckpt
 *.onnx
 *.safetensors
-models/
-data/
-datasets/
-checkpoints/
-results/
+/models/
+/data/
+/datasets/
+/checkpoints/
+/results/
 
 # ROS data
 *.bag

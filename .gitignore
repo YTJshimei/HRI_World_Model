@@ -32,3 +32,4 @@ venv/
 # Logs
 *.log
 logs/
+results_phase2b_seed42_backup/

@@ -1,0 +1,5 @@
+{
+  "train_trials": ["trial_001", "trial_002"],
+  "validation_trials": ["trial_003"],
+  "test_trials": ["trial_004"]
+}

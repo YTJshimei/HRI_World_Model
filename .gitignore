@@ -19,6 +19,7 @@ venv/
 /datasets/
 /checkpoints/
 /results/
+/results_dev/
 
 # ROS data
 *.bag

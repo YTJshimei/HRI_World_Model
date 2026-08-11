@@ -1,0 +1,22 @@
+<launch>
+  <!-- Deploy these files inside a catkin package named hri_world_model_adapter. -->
+  <arg name="source_frame" />
+  <arg name="target_frame" default="map" />
+  <arg name="input_topic" default="/human/target" />
+  <arg name="pose_output_topic" default="/wm/human_center_pose" />
+  <arg name="track_output_topic" default="/wm/human_track_id" />
+
+  <node pkg="hri_world_model_adapter"
+        type="phase2c_human_pose_adapter.py"
+        name="phase2c_human_pose_adapter"
+        output="screen"
+        required="false">
+    <param name="source_frame" value="$(arg source_frame)" />
+    <param name="target_frame" value="$(arg target_frame)" />
+    <param name="input_topic" value="$(arg input_topic)" />
+    <param name="pose_output_topic" value="$(arg pose_output_topic)" />
+    <param name="track_output_topic" value="$(arg track_output_topic)" />
+    <param name="tf_timeout" value="0.1" />
+    <param name="statistics_log_every" value="100" />
+  </node>
+</launch>

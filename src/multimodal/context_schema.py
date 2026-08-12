@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 
 import numpy as np
@@ -20,6 +21,7 @@ TOKEN_DIMS = {
     "candidate": 8, "uncertainty": 12, "diagnostic": 12,
     "interaction": 8, "scene": 8,
 }
+CONTEXT_DIM = sum(TOKEN_DIMS.values())
 
 
 @dataclass(frozen=True)
@@ -43,6 +45,54 @@ class StructuredContextTokens:
 
     def flattened(self) -> np.ndarray:
         return np.concatenate([np.asarray(self.tokens[name], np.float32) for name in TOKEN_ORDER])
+
+
+def _flatten_token_groups(tokens: Mapping[str, np.ndarray]) -> np.ndarray:
+    """Flatten one explicitly grouped context in the canonical schema order."""
+    if set(tokens) != set(TOKEN_ORDER):
+        raise ValueError("context must contain every canonical token group")
+    groups = []
+    for name in TOKEN_ORDER:
+        value = np.asarray(tokens[name], dtype=np.float32)
+        if value.shape != (TOKEN_DIMS[name],):
+            raise ValueError(f"{name} token must have shape [{TOKEN_DIMS[name]}]")
+        groups.append(value)
+    return np.concatenate(groups)
+
+
+def prepare_context_batch(
+    features: np.ndarray
+    | StructuredContextTokens
+    | Mapping[str, np.ndarray]
+    | Sequence[StructuredContextTokens],
+) -> np.ndarray:
+    """Return canonical ``[B, 108]`` float32 features without guessing layouts.
+
+    A flat single sample receives only a batch dimension. Explicit grouped
+    samples are concatenated using ``TOKEN_ORDER``. Unknown layouts, including
+    an ambiguous ``[B, 9, 12]`` tensor, are rejected rather than flattened.
+    """
+    if isinstance(features, StructuredContextTokens):
+        array = features.flattened()[None, :]
+    elif isinstance(features, Mapping):
+        array = _flatten_token_groups(features)[None, :]
+    elif isinstance(features, Sequence) and not isinstance(features, (str, bytes, np.ndarray)):
+        if features and all(isinstance(item, StructuredContextTokens) for item in features):
+            array = np.stack([item.flattened() for item in features])
+        else:
+            array = np.asarray(features)
+    else:
+        array = np.asarray(features)
+
+    if array.ndim == 1:
+        if array.shape != (CONTEXT_DIM,):
+            raise ValueError(f"single context sample must have shape [{CONTEXT_DIM}]")
+        array = array[None, :]
+    elif array.ndim != 2 or array.shape[1] != CONTEXT_DIM:
+        raise ValueError(f"context batch must have shape [B,{CONTEXT_DIM}]")
+    if not np.isfinite(array).all():
+        raise ValueError("context features must be finite")
+    return np.ascontiguousarray(array, dtype=np.float32)
 
 
 def _pad(values: np.ndarray, size: int) -> np.ndarray:

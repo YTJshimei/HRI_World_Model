@@ -20,6 +20,47 @@ class SafetyGateResult:
     fallback_reason: str
 
 
+def chance_constrained_candidate_mask(
+    hard_feasible: np.ndarray,
+    predicted_minimum_distance: np.ndarray,
+    sigma_minimum_distance: np.ndarray,
+    p_unsafe: np.ndarray,
+    chance_probability: np.ndarray,
+    safe_distance: float,
+    epsilon: float,
+    lcb_multiplier: float,
+    mode: str = "hybrid",
+) -> tuple[np.ndarray, tuple[str, ...]]:
+    """Create the sole immutable feasible mask used by selection and fallback."""
+    arrays = tuple(np.asarray(value) for value in (
+        hard_feasible, predicted_minimum_distance, sigma_minimum_distance,
+        p_unsafe, chance_probability,
+    ))
+    if len({value.shape for value in arrays}) != 1:
+        raise ValueError("chance gate arrays must have matching shapes")
+    if mode not in {"point", "lcb", "probability", "hybrid"}:
+        raise ValueError(f"unknown chance gate mode: {mode}")
+    if not 0.0 <= epsilon <= 1.0:
+        raise ValueError("epsilon must be in [0,1]")
+    if np.any(arrays[4] < 0.0) or np.any(arrays[4] > 1.0):
+        raise ValueError("chance_probability must be in [0,1]")
+    allowed = arrays[0].astype(bool).copy()
+    reasons = ["" for _ in range(len(allowed))]
+    lcb = arrays[1] - float(lcb_multiplier) * arrays[2]
+    for index in range(len(allowed)):
+        if not arrays[0][index]:
+            allowed[index] = False; reasons[index] = "hard_invalid"
+        elif mode in {"point", "hybrid"} and arrays[1][index] < safe_distance:
+            allowed[index] = False; reasons[index] = "point_minimum"
+        elif mode in {"lcb", "hybrid"} and lcb[index] < safe_distance:
+            allowed[index] = False; reasons[index] = "distance_lcb"
+        elif mode in {"probability", "hybrid"} and arrays[4][index] >= epsilon:
+            allowed[index] = False; reasons[index] = "chance_constraint"
+        elif mode == "hybrid" and arrays[3][index] >= epsilon:
+            allowed[index] = False; reasons[index] = "calibrated_p_unsafe"
+    return allowed, tuple(reasons)
+
+
 def risk_aware_candidate_mask(
     feasible: np.ndarray,
     predicted_minimum_distance: np.ndarray,

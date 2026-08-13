@@ -9,7 +9,7 @@ import numpy as np
 import torch
 
 from src.data.functional_response_state import RESPONSE_STATE_SCALE
-from src.data.robot_action_schema import ACTION_DEFINITIONS
+from src.data.robot_action_schema import ACTION_DEFINITIONS, HOLD_ACTION_ID
 from src.data.skeleton_schema import compute_root
 from src.decision.decision_state import DecisionState
 from src.models.functional_response_decoder import FunctionalResponseDecoder
@@ -41,6 +41,14 @@ def _robot_future(
     dt = 1.0 / sample_rate_hz
     results = []
     for action_id in action_ids:
+        if int(action_id) == HOLD_ACTION_ID:
+            from src.data.hold_candidate import hold_robot_rollout
+            results.append(
+                hold_robot_rollout(
+                    robot_history, future_frames, sample_rate_hz
+                ).xy
+            )
+            continue
         definition = ACTION_DEFINITIONS[int(action_id)]
         position = robot_history[-1, :2].astype(np.float64).copy()
         yaw = float(robot_history[-1, 2])

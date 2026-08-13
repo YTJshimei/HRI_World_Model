@@ -95,11 +95,12 @@ def build_tokens(episodes,split_name,population_theta):
 
 def train_model(model,train_samples,train_targets,train_meta,val_samples,val_targets,val_meta,args,torch):
  from src.multimodal.context_schema import prepare_context_batch
+ from src.multimodal.context_dataset import fit_benefit_normalizer
  device=torch.device(args.device);model=model.to(device)
  train_keep=np.asarray([row["feasible"] for row in train_meta],bool);val_keep=np.asarray([row["feasible"] for row in val_meta],bool)
  raw_x=prepare_context_batch(train_samples)[train_keep];raw_vx=prepare_context_batch(val_samples)[val_keep]
  feature_mean=raw_x.mean(0);feature_scale=raw_x.std(0);feature_scale=np.where(feature_scale<1e-5,1.,feature_scale)
- raw_y=np.asarray([t.benefit for t in train_targets],np.float32)[train_keep];benefit_mean=float(raw_y.mean());benefit_scale=max(float(raw_y.std()),1e-4)
+ normalizer=fit_benefit_normalizer(train_samples,train_targets,train_meta);raw_y=np.asarray([t.benefit for t in train_targets],np.float32)[train_keep];benefit_mean=normalizer.mean;benefit_scale=normalizer.scale
  x=torch.from_numpy(((raw_x-feature_mean)/feature_scale).astype(np.float32));y=torch.from_numpy(((raw_y-benefit_mean)/benefit_scale).astype(np.float32));h=torch.tensor([t.harm for i,t in enumerate(train_targets) if train_keep[i]],dtype=torch.float32);aux=torch.from_numpy(np.stack([t.auxiliary for i,t in enumerate(train_targets) if train_keep[i]])).float();vx=torch.from_numpy(((raw_vx-feature_mean)/feature_scale).astype(np.float32));vy=torch.from_numpy(((np.asarray([t.benefit for i,t in enumerate(val_targets) if val_keep[i]],np.float32)-benefit_mean)/benefit_scale).astype(np.float32));vh=torch.tensor([t.harm for i,t in enumerate(val_targets) if val_keep[i]],dtype=torch.float32);va=torch.from_numpy(np.stack([t.auxiliary for i,t in enumerate(val_targets) if val_keep[i]])).float();opt=torch.optim.AdamW(model.parameters(),lr=8e-4,weight_decay=1e-3);g=torch.Generator().manual_seed(args.seed);best=(float("inf"),None,0)
  for epoch in range(1,args.epochs+1):
   model.train();order=torch.randperm(len(x),generator=g)

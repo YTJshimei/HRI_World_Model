@@ -6,7 +6,9 @@ from dataclasses import dataclass
 
 import numpy as np
 
-from src.data.robot_action_schema import PHASE4A_ACTIONS, RobotAction, ACTION_DEFINITIONS
+from src.data.robot_action_schema import (
+    ACTION_DEFINITIONS, HOLD_ACTION_ID, PHASE4A_ACTIONS, RobotAction,
+)
 from src.data.skeleton_schema import compute_root, global_to_local
 from src.data.synthetic_skeleton import SkeletonSplit, generate_skeleton_split
 
@@ -81,6 +83,57 @@ class InteractionSplits:
     test_unseen_action_context: InteractionSplit
 
 
+@dataclass(frozen=True)
+class AdverseResponseRiskFactors:
+    """Continuous simulator dynamics; never a label or profile-ID lookup.
+
+    Values are sampled independently for each initial state and modulate the
+    actual future trajectory.  A downstream protocol may label only measured
+    trajectory outcomes, never these factors themselves.
+    """
+
+    braking_susceptibility: float
+    lateral_startle_gain: float
+    heading_startle_gain: float
+    approach_sensitivity: float
+    onset_delay_seconds: float
+    recovery_rate: float
+
+    def __post_init__(self) -> None:
+        values = np.asarray(tuple(self.__dict__.values()), dtype=np.float64)
+        if not np.isfinite(values).all() or np.any(values < 0.0):
+            raise ValueError("adverse-response risk factors must be finite and non-negative")
+
+
+@dataclass(frozen=True)
+class RiskConditionedInteractionSimulation:
+    future_global: np.ndarray
+    future_root: np.ndarray
+    future_local: np.ndarray
+    action_effect: np.ndarray
+    robot_future_xy: np.ndarray
+    future_human_robot_distance: np.ndarray
+    risk_factors: AdverseResponseRiskFactors
+    risk_dynamics_applied: bool
+
+
+RISK_FACTOR_NAMES = tuple(AdverseResponseRiskFactors.__dataclass_fields__)
+
+
+def sample_adverse_response_risk_factors(
+    rng: np.random.Generator,
+) -> AdverseResponseRiskFactors:
+    """Sample independent continuous susceptibility from declared support."""
+    return AdverseResponseRiskFactors(
+        braking_susceptibility=float(rng.uniform(0.15, 1.35)),
+        lateral_startle_gain=float(rng.uniform(0.10, 1.25)),
+        heading_startle_gain=float(rng.uniform(0.10, 1.20)),
+        approach_sensitivity=float(rng.uniform(0.35, 1.30)),
+        onset_delay_seconds=float(rng.uniform(0.10, 0.40)),
+        recovery_rate=float(rng.uniform(2.0, 4.5)),
+    )
+
+
 def _unit(vector: np.ndarray, fallback: np.ndarray) -> np.ndarray:
     norm = float(np.linalg.norm(vector))
     return vector / norm if norm > 1e-6 else fallback.copy()
@@ -104,6 +157,11 @@ def simulate_interaction_future(
     sample_rate_hz: float = 10.0,
 ) -> InteractionSimulation:
     """Apply a delayed residual response to the natural skeleton forecast."""
+    if int(action) == HOLD_ACTION_ID:
+        from src.data.hold_candidate import simulate_hold_interaction_future
+        return simulate_hold_interaction_future(
+            human_history, natural_future, robot_history, profile, None, sample_rate_hz
+        )
     action_id = RobotAction(int(action))
     definition = ACTION_DEFINITIONS[action_id]
     history_root = compute_root(human_history)
@@ -187,6 +245,104 @@ def simulate_interaction_future(
         robot_future_xy=robot_future_xy,
         future_human_robot_distance=future_distance,
         response_delay_frames=delay_frames,
+    )
+
+
+def simulate_risk_conditioned_interaction_future(
+    human_history: np.ndarray,
+    natural_future: np.ndarray,
+    robot_history: np.ndarray,
+    action: int | RobotAction,
+    profile: VirtualPersonProfile,
+    risk_factors: AdverseResponseRiskFactors,
+    sample_rate_hz: float = 10.0,
+) -> RiskConditionedInteractionSimulation:
+    """Apply independent susceptibility dynamics to a real future trajectory.
+
+    This wraps, but does not change, the frozen Phase-4 interaction response.
+    The added residual is driven by continuous risk factors, action semantics,
+    and the current approach geometry. Labels are deliberately absent here.
+    """
+    if int(action) == HOLD_ACTION_ID:
+        from src.data.hold_candidate import simulate_hold_interaction_future
+        return simulate_hold_interaction_future(
+            human_history, natural_future, robot_history, profile,
+            risk_factors, sample_rate_hz,
+        )
+    base = simulate_interaction_future(
+        human_history, natural_future, robot_history, action, profile, sample_rate_hz
+    )
+    action_id = RobotAction(int(action))
+    definition = ACTION_DEFINITIONS[action_id]
+    if action_id == RobotAction.KEEP:
+        return RiskConditionedInteractionSimulation(
+            base.future_global, base.future_root, base.future_local,
+            base.action_effect, base.robot_future_xy,
+            base.future_human_robot_distance, risk_factors, False,
+        )
+
+    history_root = compute_root(np.asarray(human_history))
+    velocity = (history_root[-1, :2] - history_root[-2, :2]) * sample_rate_hz
+    speed = float(np.linalg.norm(velocity))
+    fallback = np.asarray((np.cos(robot_history[-1, 2]), np.sin(robot_history[-1, 2])))
+    forward = _unit(velocity, fallback)
+    robot_to_human = history_root[-1, :2] - np.asarray(robot_history)[-1, :2]
+    away = _unit(robot_to_human, forward)
+    lateral = np.asarray((-forward[1], forward[0]))
+    current_distance = float(np.linalg.norm(robot_to_human))
+    current_bearing = float(np.asarray(robot_history)[-1, 6])
+
+    # Approach pressure is continuous and depends on state + candidate action.
+    approach = max(0.0, 1.65 - current_distance) / 0.85
+    action_pressure = (
+        max(definition.speed_scale_delta, 0.0)
+        + max(-definition.distance_offset_m, 0.0) / 0.20
+        + 0.35 * abs(definition.lateral_offset_m) / 0.20
+    )
+    pressure = risk_factors.approach_sensitivity * approach * action_pressure
+    speed_excitation = abs(definition.speed_scale_delta) / 0.10
+    distance_excitation = max(-definition.distance_offset_m, 0.0) / 0.20
+    bearing_excitation = min(abs(current_bearing) / 0.55, 1.0)
+
+    frames = len(base.future_root); dt = 1.0 / sample_rate_hz
+    time = (np.arange(frames, dtype=np.float64) + 1.0) * dt
+    active = np.maximum(time - risk_factors.onset_delay_seconds, 0.0)
+    onset = 1.0 - np.exp(-7.0 * active)
+    recovery = np.exp(-risk_factors.recovery_rate * np.maximum(active - 0.35, 0.0))
+    pulse = onset * recovery
+
+    braking_strength = (
+        risk_factors.braking_susceptibility
+        * (0.55 * pressure + 0.45 * speed_excitation)
+        * min(max(speed, 0.35), 2.0)
+    )
+    lateral_strength = (
+        risk_factors.lateral_startle_gain
+        * (0.65 * pressure + 0.35 * distance_excitation)
+        * (0.55 + 0.45 * bearing_excitation)
+    )
+    heading_strength = (
+        risk_factors.heading_startle_gain
+        * (0.55 * pressure + 0.30 * distance_excitation + 0.15 * speed_excitation)
+    )
+    bearing_sign = 1.0 if current_bearing >= 0.0 else -1.0
+    velocity_residual = (
+        -braking_strength * pulse[:, None] * forward[None]
+        + bearing_sign * lateral_strength * pulse[:, None] * lateral[None]
+    )
+    root_residual_xy = np.cumsum(velocity_residual, axis=0) * dt
+    root_residual = np.zeros((frames, 3), dtype=np.float64)
+    root_residual[:, :2] = root_residual_xy
+    yaw_residual = bearing_sign * heading_strength * pulse
+
+    risk_local = _rotate_local(base.future_local.astype(np.float64), yaw_residual)
+    risk_root = base.future_root.astype(np.float64) + root_residual
+    future = risk_root[:, None] + risk_local
+    distance = np.linalg.norm(risk_root[:, :2] - base.robot_future_xy, axis=-1)
+    return RiskConditionedInteractionSimulation(
+        future.astype(np.float32), risk_root.astype(np.float32),
+        risk_local.astype(np.float32), (future - natural_future).astype(np.float32),
+        base.robot_future_xy.copy(), distance.astype(np.float32), risk_factors, True,
     )
 
 

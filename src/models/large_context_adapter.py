@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import math
 
 import torch
 from torch import nn
@@ -67,11 +68,39 @@ class StructuredTokenProjection(nn.Module):
         return torch.stack(tokens,dim=1)
 
 
+class StructuredTokenScaleAlignment(nn.Module):
+    """Deterministically match every pseudo-token norm to a frozen native scale."""
+    def __init__(self,target_norm:float,eps:float=1e-6)->None:
+        super().__init__()
+        if not math.isfinite(target_norm) or target_norm<=0:raise ValueError("target_norm must be finite and positive")
+        self.register_buffer("target_norm",torch.tensor(float(target_norm),dtype=torch.float32))
+        self.eps=float(eps)
+    def forward(self,tokens:torch.Tensor)->torch.Tensor:
+        if tokens.ndim!=3 or tokens.shape[1]!=len(TOKEN_ORDER):raise ValueError(f"tokens must have shape [B,{len(TOKEN_ORDER)},D]")
+        norm=tokens.float().norm(dim=-1,keepdim=True)
+        direction=tokens/(norm.to(tokens.dtype)+self.eps)
+        return direction*self.target_norm.to(device=tokens.device,dtype=tokens.dtype)
+
+
+def native_embedding_norm_statistics(backbone:nn.Module,chunk_size:int=2048)->dict[str,float]:
+    """Read-only row-norm statistics; no text/token data are used."""
+    weight=backbone.get_input_embeddings().weight
+    chunks=[]
+    with torch.inference_mode():
+        for start in range(0,len(weight),chunk_size):
+            chunks.append(weight[start:start+chunk_size].float().norm(dim=-1).cpu())
+    values=torch.cat(chunks)
+    return {"mean":float(values.mean()),"median":float(values.median()),"P5":float(torch.quantile(values,.05)),"P95":float(torch.quantile(values,.95))}
+
+
 class FrozenQwen25VLContextAdapter(LargeContextAdapter):
     """Model-specific logic isolated behind the generic context adapter API."""
     MODEL_ID="Qwen/Qwen2.5-VL-3B-Instruct"
-    def __init__(self,backbone:nn.Module,hidden_size:int)->None:
+    def __init__(self,backbone:nn.Module,hidden_size:int,native_embedding_stats:dict[str,float]|None=None)->None:
         super().__init__();self.backbone=backbone;self.projection=StructuredTokenProjection(hidden_size)
+        self.native_embedding_stats=native_embedding_stats or native_embedding_norm_statistics(backbone)
+        self.scale_alignment=StructuredTokenScaleAlignment(self.native_embedding_stats["median"])
+        self.scale_alignment_enabled=True
         self.benefit=nn.Linear(hidden_size,1);self.uncertainty=nn.Linear(hidden_size,1);self.harm=nn.Linear(hidden_size,1);self.auxiliary=nn.Linear(hidden_size,6)
         for parameter in self.auxiliary.parameters():parameter.requires_grad_(False)
         self.freeze_backbone()
@@ -82,7 +111,7 @@ class FrozenQwen25VLContextAdapter(LargeContextAdapter):
         config=BitsAndBytesConfig(load_in_4bit=True,bnb_4bit_quant_type="nf4",bnb_4bit_compute_dtype=torch.bfloat16,bnb_4bit_use_double_quant=True)
         backbone=Qwen2_5_VLForConditionalGeneration.from_pretrained(model_id,quantization_config=config,device_map=device_map or {"":0},cache_dir=cache_dir,dtype=torch.bfloat16,low_cpu_mem_usage=True,local_files_only=local_files_only)
         hidden_size=int(backbone.config.text_config.hidden_size)
-        return cls(backbone,hidden_size)
+        return cls(backbone,hidden_size,native_embedding_norm_statistics(backbone))
     def freeze_backbone(self)->None:
         self.backbone.eval()
         for parameter in self.backbone.parameters():parameter.requires_grad_(False)
@@ -92,6 +121,7 @@ class FrozenQwen25VLContextAdapter(LargeContextAdapter):
         super().train(mode);self.backbone.eval();return self
     def encode(self,features:torch.Tensor)->torch.Tensor:
         projected=self.projection(features)
+        if self.scale_alignment_enabled:projected=self.scale_alignment(projected)
         device=next(self.backbone.parameters()).device
         dtype=self.backbone.get_input_embeddings().weight.dtype
         inputs=projected.to(device=device,dtype=dtype)
@@ -105,3 +135,18 @@ class FrozenQwen25VLContextAdapter(LargeContextAdapter):
         return ContextValuePrediction(encoded,self.benefit(encoded).squeeze(-1),self.uncertainty(encoded).squeeze(-1).clamp(-6,3),self.harm(encoded).squeeze(-1),self.auxiliary(encoded))
     def trainable_parameter_groups(self)->dict[str,list[nn.Parameter]]:
         return {"projection":list(self.projection.parameters()),"benefit_head":list(self.benefit.parameters()),"harm_head":list(self.harm.parameters()),"uncertainty_head":list(self.uncertainty.parameters())}
+    def trainable_state_dict(self)->dict[str,torch.Tensor]:
+        prefixes=("projection.","benefit.","harm.","uncertainty.")
+        return {name:value.detach().cpu().clone() for name,value in self.state_dict().items() if name.startswith(prefixes)}
+    def load_trainable_state_dict(self,state:dict[str,torch.Tensor])->None:
+        expected=set(self.trainable_state_dict())
+        if set(state)!=expected:raise ValueError("checkpoint must contain exactly projection and value-head state")
+        # Load only the four approved trainable modules.  Asking the complete
+        # quantized Qwen module to report ``missing_keys`` is backend/version
+        # dependent and can incorrectly reject a valid adapter-only checkpoint.
+        # Strict submodule loading leaves every backbone tensor untouched.
+        for prefix,module in (("projection.",self.projection),("benefit.",self.benefit),("harm.",self.harm),("uncertainty.",self.uncertainty)):
+            subset={name[len(prefix):]:value for name,value in state.items() if name.startswith(prefix)}
+            result=module.load_state_dict(subset,strict=True)
+            if result.missing_keys or result.unexpected_keys:
+                raise ValueError(f"trainable checkpoint does not match {prefix[:-1]} structure")
